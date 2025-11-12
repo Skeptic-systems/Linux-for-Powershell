@@ -1,0 +1,96 @@
+function Get-HandleToolPath {
+    # Ensure handler exists at fixed path; download if missing
+    $dir = "C:\Program Files\Handler"
+    $exe = Join-Path $dir "handler.exe"
+    $alt = Join-Path $dir "handle64.exe"
+    if (-not ((Test-Path -LiteralPath $exe) -or (Test-Path -LiteralPath $alt))) {
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        Invoke-WebRequest -Uri "https://live.sysinternals.com/handle64.exe" -OutFile $exe -UseBasicParsing
+    }
+    if (Test-Path -LiteralPath $exe) { return $exe }
+    if (Test-Path -LiteralPath $alt) { return $alt }
+    throw "handler.exe not found or download failed."
+}
+
+function Get-LockingPids {
+    # Return unique PIDs locking the path
+    param([Parameter(Mandatory=$true)][string]$Path)
+    $handle = Get-HandleToolPath
+    try { $full = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path } catch { $full = $Path }
+    $out = & $handle -accepteula -nobanner $full 2>$null
+    if (-not $out) { return @() }
+    $pids = $out | ForEach-Object { if ($_ -match 'pid:\s*(\d+)\s') { [int]$matches[1] } }
+    $pids | Sort-Object -Unique
+}
+
+function Show-Processes {
+    # Print processes table
+    param([int[]]$Pids)
+    if (-not $Pids -or $Pids.Count -eq 0) { Write-Host "No locking processes found."; return }
+    $procs = foreach ($procId in $Pids) {
+        try {
+            $p = Get-Process -Id $procId -ErrorAction Stop
+            [pscustomobject]@{ PID = $p.Id; Name = $p.ProcessName; MainWindow = $p.MainWindowTitle }
+        } catch {
+            [pscustomobject]@{ PID = $procId; Name = "(exited)"; MainWindow = "" }
+        }
+    }
+    $procs | Sort-Object PID | Format-Table -AutoSize
+}
+
+function Kill-Processes {
+    # Force kill by PID
+    param([int[]]$Pids)
+    if (-not $Pids -or $Pids.Count -eq 0) { return }
+    foreach ($procId in $Pids) {
+        try { Stop-Process -Id $procId -Force -ErrorAction Stop } catch { try { taskkill.exe /PID $procId /F | Out-Null } catch { } }
+    }
+    Start-Sleep -Milliseconds 300
+}
+
+function Remove-Target {
+    # Remove with small retry
+    param([string]$Path,[switch]$Recurse,[int]$Retries=3)
+    for ($i=0; $i -lt $Retries; $i++) {
+        try {
+            if ($Recurse) { Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop }
+            else { Remove-Item -LiteralPath $Path -Force -ErrorAction Stop }
+            return $true
+        } catch {
+            Start-Sleep -Milliseconds 250
+        }
+    }
+    return $false
+}
+
+function delk {
+    # delk -r <path...>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true, Position=0, ValueFromRemainingArguments=$true)][string[]]$Paths,
+        [Alias('r')][switch]$Recurse
+    )
+    foreach ($p in $Paths) {
+        Write-Host "Deleting: $p"
+        if (Remove-Target -Path $p -Recurse:$Recurse) { Write-Host "OK: $p"; continue }
+
+        $pids = @(Get-LockingPids -Path $p)
+        if ($pids.Count -eq 0) { Write-Warning "Failed to delete and no lockers found. Check permissions/attributes. $p"; continue }
+
+        Write-Host "Locked by:"
+        Show-Processes -Pids $pids
+        $answer = Read-Host "Kill these processes to remove '$p'? (y/N)"
+        if ($answer -match '^(y|yes)$') {
+            Kill-Processes -Pids $pids
+            if (Remove-Target -Path $p -Recurse:$Recurse) { Write-Host "OK after kill: $p"; continue }
+            $pids2 = @(Get-LockingPids -Path $p)
+            if ($pids2.Count -gt 0) { Kill-Processes -Pids $pids2 }
+            if (Remove-Target -Path $p -Recurse:$Recurse) { Write-Host "OK after second kill: $p"; continue }
+            Write-Error "Failed to delete '$p' even after killing lockers."
+        } else {
+            Write-Warning "User aborted kill. Not deleting: $p"
+        }
+    }
+}
+
+Set-Alias -Name deletex -Value delk -Scope Global
